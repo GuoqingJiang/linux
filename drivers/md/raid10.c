@@ -144,10 +144,13 @@ static void r10bio_pool_free(void *r10_bio, void *data)
 	kfree(r10_bio);
 }
 
+#define RESYNC_SECTORS (RESYNC_BLOCK_SIZE >> 9)
 /* amount of memory to reserve for resync requests */
 #define RESYNC_WINDOW (1024*1024)
 /* maximum number of concurrent requests, memory permitting */
 #define RESYNC_DEPTH (32*1024*1024/RESYNC_BLOCK_SIZE)
+#define CLUSTER_RESYNC_WINDOW (16 * RESYNC_WINDOW)
+#define CLUSTER_RESYNC_WINDOW_SECTORS (CLUSTER_RESYNC_WINDOW >> 9)
 
 /*
  * When performing a resync, we need to read and compare, so
@@ -2907,6 +2910,11 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		max_sector = mddev->resync_max_sectors;
 	if (sector_nr >= max_sector) {
+		if (mddev_is_clustered(mddev)) {
+			conf->cluster_sync_low = 0;
+			conf->cluster_sync_high = 0;
+		}
+
 		/* If we aborted, we need to abort the
 		 * sync on the 'current' bitmap chucks (there can
 		 * be several when recovering multiple devices).
@@ -3261,7 +3269,14 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 		/* resync. Schedule a read for every block at this virt offset */
 		int count = 0;
 
-		bitmap_cond_end_sync(mddev->bitmap, sector_nr, 0);
+		/*
+		 * we are incrementing sector_nr below. To be safe, we check
+		 * against sector_nr + two times RESYNC_SECTORS
+		 */
+		bitmap_cond_end_sync(mddev->bitmap, sector_nr,
+				     mddev_is_clustered(mddev) &&
+				     (sector_nr + 2 * RESYNC_SECTORS >
+				      conf->cluster_sync_high));
 
 		if (!bitmap_start_sync(mddev->bitmap, sector_nr,
 				       &sync_blocks, mddev->degraded) &&
@@ -3394,6 +3409,17 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 		sector_nr += len>>9;
 	} while (get_resync_pages(biolist)->idx < RESYNC_PAGES);
 	r10_bio->sectors = nr_sectors;
+
+	if (mddev_is_clustered(mddev) &&
+	    conf->cluster_sync_high < sector_nr + nr_sectors) {
+		conf->cluster_sync_low = mddev->curr_resync_completed;
+		conf->cluster_sync_high = conf->cluster_sync_low +
+					  CLUSTER_RESYNC_WINDOW_SECTORS;
+		/* Send resync message */
+		md_cluster_ops->resync_info_update(mddev,
+						   conf->cluster_sync_low,
+						   conf->cluster_sync_high);
+	}
 
 	while (biolist) {
 		bio = biolist;
