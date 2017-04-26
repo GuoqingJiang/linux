@@ -25,6 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
 #include <linux/kthread.h>
+#include <linux/sched/signal.h>
 #include <trace/events/block.h>
 #include "md.h"
 #include "raid10.h"
@@ -1308,6 +1309,25 @@ static void raid10_write_request(struct mddev *mddev, struct bio *bio,
 	int max_sectors;
 
 	md_write_start(mddev, bio);
+
+	if (bio_end_sector(bio) > mddev->suspend_lo &&
+	    bio->bi_iter.bi_sector < mddev->suspend_hi) {
+		/*
+		 * As the suspend_* range is controlled by
+		 * userspace, we want an interruptible wait.
+		 */
+		DEFINE_WAIT(w);
+		for (;;) {
+			flush_signals(current);
+			prepare_to_wait(&conf->wait_barrier, &w,
+					TASK_INTERRUPTIBLE);
+			if (bio_end_sector(bio) <= mddev->suspend_lo ||
+			    bio->bi_iter.bi_sector >= mddev->suspend_hi)
+				break;
+			schedule();
+		}
+		finish_wait(&conf->wait_barrier, &w);
+	}
 
 	/*
 	 * Register the new request and wait if the reconstruction
@@ -3818,6 +3838,9 @@ static void raid10_quiesce(struct mddev *mddev, int state)
 	struct r10conf *conf = mddev->private;
 
 	switch(state) {
+	case 2: /* wake for suspend */
+		wake_up(&conf->wait_barrier);
+		break;
 	case 1:
 		raise_barrier(conf, 0);
 		break;
