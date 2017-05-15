@@ -4749,7 +4749,7 @@ static void raid10_finish_reshape(struct mddev *mddev)
 			set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 		}
 		mddev->resync_max_sectors = size;
-		if (mddev->queue) {
+		if (!mddev_is_clustered(mddev) && mddev->queue) {
 			set_capacity(mddev->gendisk, mddev->array_sectors);
 			revalidate_disk(mddev->gendisk);
 		}
