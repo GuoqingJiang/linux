@@ -8745,6 +8745,8 @@ EXPORT_SYMBOL(md_check_recovery);
 void md_reap_sync_thread(struct mddev *mddev)
 {
 	struct md_rdev *rdev;
+	bool is_reshaped = false;
+	sector_t old_dev_sectors = mddev->dev_sectors;
 
 	/* resync has finished, collect result */
 	md_unregister_thread(&mddev->sync_thread);
@@ -8759,8 +8761,10 @@ void md_reap_sync_thread(struct mddev *mddev)
 		}
 	}
 	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
-	    mddev->pers->finish_reshape)
+	    mddev->pers->finish_reshape) {
 		mddev->pers->finish_reshape(mddev);
+		is_reshaped = true;
+	}
 
 	/* If array is no-longer degraded, then any saved_raid_disk
 	 * information must be scrapped.
@@ -8770,6 +8774,10 @@ void md_reap_sync_thread(struct mddev *mddev)
 			rdev->saved_raid_disk = -1;
 
 	md_update_sb(mddev, 1);
+	/* XXX bitmap_super_t sync_size is changed after md_update_sb */
+	if (is_reshaped && mddev_is_clustered(mddev) && mddev->level == 10)
+		md_cluster_ops->update_size(mddev, old_dev_sectors);
+
 	/* MD_SB_CHANGE_PENDING should be cleared by md_update_sb, so we can
 	 * call resync_finish here if MD_CLUSTER_RESYNC_LOCKED is set by
 	 * clustered raid */
@@ -9006,6 +9014,22 @@ static void check_sb_changes(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (mddev->raid_disks != le32_to_cpu(sb->raid_disks))
 		update_raid_disks(mddev, le32_to_cpu(sb->raid_disks));
+
+	/* after update_raid_disks, the delta_disks might have changed for raid10,
+	 * so let's do reshape to let raid10_start_reshape -> raid10_add_disk happen */
+	rdev_for_each(rdev2, mddev) {
+		if (test_bit(Faulty, &rdev2->flags))
+			continue;
+
+		/* Check if the roles changed */
+		role = le16_to_cpu(sb->dev_roles[rdev2->desc_nr]);
+
+		if (role != rdev2->raid_disk && mddev->level == 10) {
+			/* for cluster raid10, perform reshape */
+			set_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+			mddev->pers->start_reshape(mddev);
+		}
+	}
 
 	/* Finally set the event to be up to date */
 	mddev->events = le64_to_cpu(sb->events);
